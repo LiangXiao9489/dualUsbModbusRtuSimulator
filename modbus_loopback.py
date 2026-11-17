@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import threading, random, struct, time
+import threading, random, struct, time, queue
 import serial
 from serial.tools import list_ports
 
@@ -27,7 +27,7 @@ def readf(p, stop, request=False):
 
 class App(tk.Tk):
  def __init__(self):
-  super().__init__(); self.title('双 USB-RS485 Modbus RTU 回环模拟器'); self.geometry('950x650'); self.stop=threading.Event(); self.ps=[]; self.make(); self.ports(); self.after(100,self.flush); self.protocol('WM_DELETE_WINDOW',self.close)
+  super().__init__(); self.title('双 USB-RS485 Modbus RTU 回环模拟器'); self.geometry('950x650'); self.stop=threading.Event(); self.ps=[]; self.log_queue=queue.Queue(); self.make(); self.ports(); self.after(100,self.flush); self.protocol('WM_DELETE_WINDOW',self.close)
  def make(self):
   self.v={k:tk.StringVar(value=x) for k,x in {'m':'','s':'','baud':'9600','parity':'N','data':'8','stop':'1','unit':'1','interval':'1','cycles':'0'}.items()}
   g=ttk.LabelFrame(self,text='串口及轮询参数');g.pack(fill='x',padx=8,pady=6)
@@ -56,18 +56,20 @@ class App(tk.Tk):
   for f,tree in self.tables.items():
    tree.delete(*tree.get_children())
    for address,value in self.data.get(f,{}).items(): tree.insert('', 'end', values=(address,value))
- def put(self,s): self.log.config(state='normal');self.log.insert('end',time.strftime('%H:%M:%S ')+s+'\n');self.log.see('end');self.log.config(state='disabled')
+ def put(self,s): self.log_queue.put(s)
  def start(self):
   if self.ps:return
   try:
-   kw=dict(baudrate=int(self.v['baud'].get()),bytesize=int(self.v['data'].get()),parity=self.v['parity'].get(),stopbits=float(self.v['stop'].get()),timeout=.05);self.unit=int(self.v['unit'].get());self.data=getattr(self,'data', {f:{i:0 for i in range(100)} for f in range(1,5)});self.ps=[serial.Serial(self.v['m'].get(),**kw),serial.Serial(self.v['s'].get(),**kw)];self.stop.clear();threading.Thread(target=self.slave,daemon=True).start();threading.Thread(target=self.master,daemon=True).start();self.put('--- 已开始 ---')
+   kw=dict(baudrate=int(self.v['baud'].get()),bytesize=int(self.v['data'].get()),parity=self.v['parity'].get(),stopbits=float(self.v['stop'].get()),timeout=.05);self.unit=int(self.v['unit'].get());self.data=getattr(self,'data', {f:{i:0 for i in range(100)} for f in range(1,5)});self.ps=[serial.Serial(self.v['m'].get(),**kw),serial.Serial(self.v['s'].get(),**kw)];self.stop.clear();self.put('111已开始');threading.Thread(target=self.slave_loop,daemon=True).start();threading.Thread(target=self.master_loop,daemon=True).start()
   except Exception as e:self.put('启动失败: '+str(e));self.stoprun()
- def slave(self):
-  while not self.stop.is_set():
-   q=readf(self.ps[1],self.stop,True)
-   if q:self.put('从站 RX '+text(q));r=self.reply(q)
-   else:r=None
-   if r:self.ps[1].write(r);self.put('从站 TX '+text(r))
+ def slave_loop(self):
+  try:
+   while not self.stop.is_set():
+    q=readf(self.ps[1],self.stop,True)
+    if q:self.put('[slave 接收到 master 发送 '+text(q)+']');r=self.reply(q)
+    else:r=None
+    if r:self.ps[1].write(r);self.put('[slave 返回 '+text(r)+' 给 master]')
+  except Exception as e:self.put('[slave 线程异常: '+str(e)+']')
  def reply(self,q):
   if len(q)<8 or q[0]!=self.unit or not ok(q):return None
   f=q[1];a,n=struct.unpack('>HH',q[2:6]);d=self.data.get(f)
@@ -77,20 +79,28 @@ class App(tk.Tk):
    z=b''.join(struct.pack('>H',d[a+i]) for i in range(n));return frame(bytes((self.unit,f,len(z)))+z)
   if f in (5,6) and a in self.data[1 if f==5 else 3]: self.data[1 if f==5 else 3][a]=q[5]&1 if f==5 else struct.unpack('>H',q[4:6])[0];self.after(0,self.refresh_points);return q
   return frame(bytes((self.unit,f|128,2)))
- def master(self):
-  fs=[1,2,3,4,5,6];limit=int(self.v['cycles'].get());i=0
-  while not self.stop.is_set() and (not limit or i<limit):
-   f=random.choice(fs);a=random.randrange(0,30);n=random.randint(1,4);v=random.randint(0,1 if f==5 else 65535)
-   q=frame(struct.pack('>BBHH',self.unit,f,a,n if f<5 else v));self.ps[0].write(q);self.put('主站 TX '+text(q));r=readf(self.ps[0],self.stop)
-   if r:self.put('主站 RX '+text(r)+(' [CRC OK]' if ok(r) else ' [CRC ERROR]'))
-   i+=1;self.stop.wait(float(self.v['interval'].get()))
-  if limit:self.put('--- 完成 %d 次 ---'%i)
+ def master_loop(self):
+  try:
+   self.put('[master 工作线程已启动]')
+   fs=[1,2,3,4,5,6];limit=int(self.v['cycles'].get());i=0
+   while not self.stop.is_set() and (not limit or i<limit):
+    f=random.choice(fs);a=random.randrange(0,30);n=random.randint(1,4);v=random.randint(0,1 if f==5 else 65535)
+    q=frame(struct.pack('>BBHH',self.unit,f,a,n if f<5 else v));self.ps[0].write(q);self.put('[master 发送 '+text(q)+' 到 slave]');r=readf(self.ps[0],self.stop)
+    if r:self.put('[master 接收到 slave 返回 '+text(r)+']'+(' [CRC OK]' if ok(r) else ' [CRC ERROR]'))
+    i+=1;self.stop.wait(float(self.v['interval'].get()))
+   if limit:self.put('--- 完成 %d 次 ---'%i)
+  except Exception as e:self.put('[master 线程异常: '+str(e)+']')
  def stoprun(self):
   self.stop.set()
   for p in self.ps:
    try:p.close()
    except:pass
   self.ps=[]
- def flush(self):self.after(100,self.flush)
+ def flush(self):
+  while True:
+   try:s=self.log_queue.get_nowait()
+   except queue.Empty:break
+   self.log.config(state='normal');self.log.insert('end',time.strftime('%H:%M:%S ')+s+'\n');self.log.see('end');self.log.config(state='disabled')
+  self.after(100,self.flush)
  def close(self):self.stoprun();self.destroy()
 if __name__=='__main__':App().mainloop()
