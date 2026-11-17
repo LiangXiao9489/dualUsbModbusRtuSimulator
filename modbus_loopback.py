@@ -45,6 +45,7 @@ class App(tk.Tk):
   self.tables={}; tabs=ttk.Notebook(left);tabs.pack(fill='both',expand=True)
   for title,fn in (('线圈',1),('离散输入',2),('输入寄存器',4),('保持寄存器',3)):
    tab=ttk.Frame(tabs);tabs.add(tab,text=title);tree=ttk.Treeview(tab,columns=('address','value'),show='headings');tree.heading('address',text='地址');tree.heading('value',text='值');tree.column('address',width=70,anchor='center');tree.column('value',width=90,anchor='center');tree.pack(side='left',fill='both',expand=True);scroll=ttk.Scrollbar(tab,orient='vertical',command=tree.yview);scroll.pack(side='right',fill='y');tree.configure(yscrollcommand=scroll.set);self.tables[fn]=tree
+  logbar=ttk.Frame(right);logbar.pack(fill='x',padx=4,pady=3);ttk.Button(logbar,text='一键清屏',command=self.clear_log).pack(side='right')
   self.log=tk.Text(right,state='disabled');self.log.pack(fill='both',expand=True)
  def ports(self):
   a=[x.device for x in list_ports.comports()];self.m_widget['values']=self.s_widget['values']=a
@@ -57,6 +58,8 @@ class App(tk.Tk):
    tree.delete(*tree.get_children())
    for address,value in self.data.get(f,{}).items(): tree.insert('', 'end', values=(address,value))
  def put(self,s): self.log_queue.put(s)
+ def clear_log(self):
+  self.log.config(state='normal');self.log.delete('1.0','end');self.log.config(state='disabled')
  def start(self):
   if self.ps:return
   try:
@@ -85,8 +88,8 @@ class App(tk.Tk):
    fs=[1,2,3,4,5,6];limit=int(self.v['cycles'].get());i=0
    while not self.stop.is_set() and (not limit or i<limit):
     f=random.choice(fs);a=random.randrange(0,30);n=random.randint(1,4);v=random.randint(0,1 if f==5 else 65535)
-    q=frame(struct.pack('>BBHH',self.unit,f,a,n if f<5 else v));self.ps[0].write(q);self.put('[master 发送 '+text(q)+' 到 slave]');r=readf(self.ps[0],self.stop)
-    if r:self.put('[master 接收到 slave 返回 '+text(r)+']')
+    q=frame(struct.pack('>BBHH',self.unit,f,a,n if f<5 else v));self.ps[0].write(q);self.put('[master 发送 '+text(q)+']');r=readf(self.ps[0],self.stop)
+    if r:self.put('[master 接收 '+text(r)+']');self.put('----------------------------------------------------')
     i+=1;self.stop.wait(float(self.v['interval'].get())/1000.0)
    if limit:self.put('--- 完成 %d 次 ---'%i)
   except Exception as e:self.put('[master 线程异常: '+str(e)+']')
