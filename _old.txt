@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Dual USB-RS485 Modbus RTU loopback simulator.
+
+The two adapters must be electrically connected to the same RS-485 bus.  This
+program opens one adapter as a Modbus master and the other as a Modbus slave.
+It does not bridge or echo bytes between ports; each port is independently
+observed, which is the normal arrangement when both adapters share the bus.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import struct
+import threading
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+import serial
+from serial import SerialException
+
+
+LOG = logging.getLogger("modbus-loopback")
+
+
+def crc16(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
+def add_crc(data: bytes) -> bytes:
+    value = crc16(data)
+    return data + struct.pack("<H", value)
+
+
+def valid_frame(frame: bytes) -> bool:
+    return len(frame) >= 4 and crc16(frame[:-2]) == struct.unpack("<H", frame[-2:])[0]
+
+
+def hex_bytes(data: bytes) -> str:
+    return " ".join(f"{b:02X}" for b in data)
+
+
+def frame_length(prefix: bytes, request: bool = False) -> Optional[int]:
+    """Return expected RTU length once enough header bytes are available."""
+    if len(prefix) < 2:
+        return None
+    function = prefix[1] & 0x7F
+    if prefix[1] & 0x80:
+        return 5
+    if function in (1, 2, 3, 4):
+        # Requests contain address/count and are always 8 bytes. Responses
+        # contain a byte-count at offset 2.
+        return 8 if request else (3 + prefix[2] + 2 if len(prefix) >= 3 else None)
+    if function in (5, 6):
+        return 8
+    if function in (15, 16):
+        if request:
+            return 9 + prefix[6] if len(prefix) >= 7 else None
+        return 8
+    return None
+
+
+def read_rtu_frame(port: serial.Serial, stop: threading.Event, request: bool = False) -> Optional[bytes]:
+    """Read one frame, using the serial port timeout as an inter-byte guard."""
+    data = bytearray()
+    while not stop.is_set():
+        chunk = port.read(1)
+        if not chunk:
+            return bytes(data) if data else None
+        data += chunk
+        length = frame_length(data, request=request)
+        if length and len(data) >= length:
+            return bytes(data[:length])
+        # Unknown function: retain the frame until a quiet line period.
+        if len(data) >= 256:
+            return bytes(data)
+    return None
+
+
+@dataclass
+class SlaveStore:
+    unit_id: int
+    registers: list[int]
+
+    def response(self, request: bytes) -> Optional[bytes]:
+        if len(request) < 4 or request[0] != self.unit_id or not valid_frame(request):
+            return None
+        function = request[1]
+        if function in (3, 4):
+            if len(request) != 8:
+                return self.exception(function, 3)
+            address, count = struct.unpack(">HH", request[2:6])
+            if count < 1 or count > 125 or address + count > len(self.registers):
+                return self.exception(function, 2)
+            payload = b"".join(struct.pack(">H", self.registers[address + i] & 0xFFFF) for i in range(count))
+            return add_crc(bytes((self.unit_id, function, len(payload))) + payload)
+        if function == 6:
+            if len(request) != 8:
+                return self.exception(function, 3)
+            address, value = struct.unpack(">HH", request[2:6])
+            if address >= len(self.registers):
+                return self.exception(function, 2)
+            self.registers[address] = value
+            return request
+        if function == 16:
+            if len(request) < 9:
+                return self.exception(function, 3)
+            address, count, byte_count = struct.unpack(">HHB", request[2:7])
+            if count < 1 or count > 123 or byte_count != count * 2 or len(request) != 9 + byte_count:
+                return self.exception(function, 3)
+            if address + count > len(self.registers):
+                return self.exception(function, 2)
+            for i in range(count):
+                self.registers[address + i] = struct.unpack(">H", request[7 + i * 2:9 + i * 2])[0]
+            return add_crc(bytes((self.unit_id, function)) + struct.pack(">HH", address, count))
+        return self.exception(function, 1)
+
+    def exception(self, function: int, code: int) -> bytes:
+        return add_crc(bytes((self.unit_id, function | 0x80, code)))
+
+
+def open_port(name: str, args: argparse.Namespace) -> serial.Serial:
+    return serial.Serial(
+        port=name,
+        baudrate=args.baud,
+        bytesize=args.data_bits,
+        parity=args.parity,
+        stopbits=args.stop_bits,
+        timeout=args.timeout,
+        write_timeout=1,
+    )
+
+
+def slave_loop(port: serial.Serial, store: SlaveStore, stop: threading.Event) -> None:
+    while not stop.is_set():
+        request = read_rtu_frame(port, stop, request=True)
+        if not request:
+            continue
+        LOG.info("SLAVE RX  %-47s %s", hex_bytes(request), "CRC OK" if valid_frame(request) else "CRC ERROR")
+        response = store.response(request)
+        if response:
+            port.write(response)
+            port.flush()
+            LOG.info("SLAVE TX  %s", hex_bytes(response))
+
+
+def master_loop(port: serial.Serial, args: argparse.Namespace, stop: threading.Event) -> None:
+    request = add_crc(struct.pack(">BBHH", args.unit_id, args.function, args.address, args.quantity))
+    while not stop.is_set():
+        port.write(request)
+        port.flush()
+        LOG.info("MASTER TX  %s", hex_bytes(request))
+        deadline = time.monotonic() + args.response_timeout
+        while time.monotonic() < deadline and not stop.is_set():
+            response = read_rtu_frame(port, stop)
+            if response:
+                LOG.info("MASTER RX  %-47s %s", hex_bytes(response), "CRC OK" if valid_frame(response) else "CRC ERROR")
+                break
+        stop.wait(args.interval)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--master-port", required=True, help="主站 USB-RS485 的 COM 口，例如 COM3")
+    p.add_argument("--slave-port", required=True, help="从站 USB-RS485 的 COM 口，例如 COM4")
+    p.add_argument("--baud", type=int, default=9600)
+    p.add_argument("--data-bits", type=int, choices=(5, 6, 7, 8), default=8)
+    p.add_argument("--parity", choices=("N", "E", "O"), default="N")
+    p.add_argument("--stop-bits", type=float, choices=(1, 1.5, 2), default=1)
+    p.add_argument("--timeout", type=float, default=0.05, help="串口读取超时（秒）")
+    p.add_argument("--response-timeout", type=float, default=1.0)
+    p.add_argument("--interval", type=float, default=2.0, help="主站轮询间隔（秒）")
+    p.add_argument("--unit-id", type=int, default=1)
+    p.add_argument("--function", type=int, choices=(3, 4), default=3)
+    p.add_argument("--address", type=int, default=0)
+    p.add_argument("--quantity", type=int, default=4)
+    p.add_argument("--registers", type=int, default=100, help="从站保持寄存器数量")
+    p.add_argument("--log-file", help="可选日志文件")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not 1 <= args.unit_id <= 247 or args.address < 0 or args.quantity < 1:
+        raise SystemExit("unit-id、address、quantity 参数无效")
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S", handlers=handlers)
+    stop = threading.Event()
+    try:
+        master = open_port(args.master_port, args)
+        slave = open_port(args.slave_port, args)
+    except SerialException as exc:
+        LOG.error("打开串口失败: %s", exc)
+        return 2
+    store = SlaveStore(args.unit_id, list(range(args.registers)))
+    threads = [
+        threading.Thread(target=master_loop, args=(master, args, stop), daemon=True),
+        threading.Thread(target=slave_loop, args=(slave, store, stop), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    LOG.info("运行中；按 Ctrl+C 停止。主站=%s 从站=%s", args.master_port, args.slave_port)
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        LOG.info("正在停止...")
+    finally:
+        stop.set()
+        master.close()
+        slave.close()
+        for thread in threads:
+            thread.join(timeout=1)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
