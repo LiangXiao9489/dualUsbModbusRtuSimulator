@@ -29,15 +29,15 @@ class App(tk.Tk):
  def __init__(self):
   super().__init__(); self.title('双 USB-RS485 Modbus RTU 回环模拟器'); self.geometry('950x650'); self.stop=threading.Event(); self.ps=[]; self.log_queue=queue.Queue(); self.make(); self.ports(); self.after(100,self.flush); self.protocol('WM_DELETE_WINDOW',self.close)
  def make(self):
-  self.v={k:tk.StringVar(value=x) for k,x in {'m':'','s':'','baud':'9600','parity':'N','data':'8','stop':'1','unit':'1','interval':'1','cycles':'0'}.items()}
+  self.v={k:tk.StringVar(value=x) for k,x in {'m':'','s':'','baud':'9600','parity':'N','data':'8','stop':'1','unit':'1','interval':'2000','cycles':'0'}.items()}
   g=ttk.LabelFrame(self,text='串口及轮询参数');g.pack(fill='x',padx=8,pady=6)
-  fs=[('主站串口','m'),('从站串口','s'),('波特率','baud'),('校验','parity'),('数据位','data'),('停止位','stop'),('从站地址','unit'),('间隔(秒)','interval'),('循环次数(0=无限)','cycles')]
+  fs=[('主站串口','m'),('从站串口','s'),('波特率','baud'),('校验','parity'),('数据位','data'),('停止位','stop'),('从站地址','unit'),('间隔(毫秒)','interval'),('循环次数(0=无限)','cycles')]
   for i,(t,k) in enumerate(fs):
    ttk.Label(g,text=t).grid(row=i//5*2,column=i%5*2,sticky='w'); w=ttk.Combobox(g,textvariable=self.v[k],width=9,state='readonly') if k in ('m','s','parity') else ttk.Entry(g,textvariable=self.v[k],width=9); w.grid(row=i//5*2+1,column=i%5*2)
    if k=='parity':w['values']=('N','E','O')
    setattr(self,k+'_widget',w)
   ttk.Button(g,text='刷新串口',command=self.ports).grid(row=1,column=9);ttk.Button(g,text='开始',command=self.start).grid(row=3,column=8);ttk.Button(g,text='停止',command=self.stoprun).grid(row=3,column=9)
-  p=ttk.LabelFrame(self,text='一键配置从机随机点表');p.pack(fill='x',padx=8,pady=4);self.n={k:tk.IntVar(value=100) for k in ('线圈','离散输入','输入寄存器','保持寄存器')}
+  p=ttk.LabelFrame(self,text='一键配置从机随机点表');p.pack(fill='x',padx=8,pady=4);self.n={k:tk.IntVar(value=10) for k in ('线圈','离散输入','输入寄存器','保持寄存器')}
   for i,k in enumerate(self.n):ttk.Label(p,text=k+'数量').grid(row=0,column=i*2);ttk.Entry(p,textvariable=self.n[k],width=8).grid(row=0,column=i*2+1)
   ttk.Button(p,text='生成随机点表',command=self.points).grid(row=0,column=8);self.status=ttk.Label(p,text='未生成');self.status.grid(row=0,column=9)
   split=ttk.PanedWindow(self,orient='horizontal');split.pack(fill='both',expand=True,padx=8,pady=6)
@@ -66,9 +66,9 @@ class App(tk.Tk):
   try:
    while not self.stop.is_set():
     q=readf(self.ps[1],self.stop,True)
-    if q:self.put('[slave 接收到 master 发送 '+text(q)+']');r=self.reply(q)
+    if q:r=self.reply(q)
     else:r=None
-    if r:self.ps[1].write(r);self.put('[slave 返回 '+text(r)+' 给 master]')
+    if r:self.ps[1].write(r)
   except Exception as e:self.put('[slave 线程异常: '+str(e)+']')
  def reply(self,q):
   if len(q)<8 or q[0]!=self.unit or not ok(q):return None
@@ -86,8 +86,8 @@ class App(tk.Tk):
    while not self.stop.is_set() and (not limit or i<limit):
     f=random.choice(fs);a=random.randrange(0,30);n=random.randint(1,4);v=random.randint(0,1 if f==5 else 65535)
     q=frame(struct.pack('>BBHH',self.unit,f,a,n if f<5 else v));self.ps[0].write(q);self.put('[master 发送 '+text(q)+' 到 slave]');r=readf(self.ps[0],self.stop)
-    if r:self.put('[master 接收到 slave 返回 '+text(r)+']'+(' [CRC OK]' if ok(r) else ' [CRC ERROR]'))
-    i+=1;self.stop.wait(float(self.v['interval'].get()))
+    if r:self.put('[master 接收到 slave 返回 '+text(r)+']')
+    i+=1;self.stop.wait(float(self.v['interval'].get())/1000.0)
    if limit:self.put('--- 完成 %d 次 ---'%i)
   except Exception as e:self.put('[master 线程异常: '+str(e)+']')
  def stoprun(self):
@@ -100,7 +100,7 @@ class App(tk.Tk):
   while True:
    try:s=self.log_queue.get_nowait()
    except queue.Empty:break
-   self.log.config(state='normal');self.log.insert('end',time.strftime('%H:%M:%S ')+s+'\n');self.log.see('end');self.log.config(state='disabled')
+   timestamp=time.strftime('%H:%M:%S.')+('%03d'%(int(time.time()*1000)%1000));self.log.config(state='normal');self.log.insert('end',timestamp+' '+s+'\n');self.log.see('end');self.log.config(state='disabled')
   self.after(100,self.flush)
  def close(self):self.stoprun();self.destroy()
 if __name__=='__main__':App().mainloop()
